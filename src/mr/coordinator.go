@@ -5,6 +5,7 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
+import "sync"
 
 type Coordinator struct {
 	// Your definitions here.
@@ -15,30 +16,35 @@ type Coordinator struct {
 	nMap        int
 	startMap    int
 	doneMap     int
+	mu          sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) GetTask(args *MyArgs, reply *MyReply) error {
-	if c.startMap < c.nMap { // assign map task
-		reply.JobType = MapJob
-		reply.Index = c.startMap
-		reply.Filename = c.files[c.startMap]
-		c.startMap++
-		reply.NReduce = c.nReduce
-		reply.NMap = c.nMap
-	} else if c.doneMap < c.nMap {
-		reply.JobType = WaitJob
-	} else if c.startReduce < c.nReduce {
-		reply.JobType = ReduceJob
-		reply.Index = c.startReduce
-		c.startReduce++
-		reply.NReduce = c.nReduce
-		reply.NMap = c.nMap
-	} else if c.doneReduce < c.nReduce {
-		reply.JobType = WaitJob
-	} else {
-		reply.JobType = CompleteJob
-	}
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.startMap < c.nMap { // assign map task
+			reply.JobType = MapJob
+			reply.Index = c.startMap
+			reply.Filename = c.files[c.startMap]
+			c.startMap++
+			reply.NReduce = c.nReduce
+			reply.NMap = c.nMap
+		} else if c.doneMap < c.nMap {
+			reply.JobType = WaitJob
+		} else if c.startReduce < c.nReduce {
+			reply.JobType = ReduceJob
+			reply.Index = c.startReduce
+			c.startReduce++
+			reply.NReduce = c.nReduce
+			reply.NMap = c.nMap
+		} else if c.doneReduce < c.nReduce {
+			reply.JobType = WaitJob
+		} else {
+			reply.JobType = CompleteJob
+		}
+	}()
 	// log.Printf("%v", reply)
 	return nil
 }
