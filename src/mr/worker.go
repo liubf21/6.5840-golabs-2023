@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -85,54 +86,8 @@ func doHeartbeat() GetTaskResponse {
 func doReport(i int) {
 	args := ReportRequest{Index: i}
 	reply := ReportResponse{}
+	// log.Printf("report: %v", args)
 	call("Coordinator.Report", &args, &reply)
-}
-
-func atomicWriteFile(filename string, r io.Reader) (err error) {
-	// write to a temp file first, then we'll atomically replace the target file
-	// with the temp file.
-	dir, file := filepath.Split(filename)
-	if dir == "" {
-		dir = "."
-	}
-
-	f, err := ioutil.TempFile(dir, file)
-	if err != nil {
-		return fmt.Errorf("cannot create temp file: %v", err)
-	}
-	defer func() {
-		if err != nil {
-			// Don't leave the temp file lying around on error.
-			_ = os.Remove(f.Name()) // yes, ignore the error, not much we can do about it.
-		}
-	}()
-	// ensure we always close f. Note that this does not conflict with  the
-	// close below, as close is idempotent.
-	defer f.Close()
-	name := f.Name()
-	if _, err := io.Copy(f, r); err != nil {
-		return fmt.Errorf("cannot write data to tempfile %q: %v", name, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("can't close tempfile %q: %v", name, err)
-	}
-
-	// get the file mode from the original file and use that for the replacement
-	// file, too.
-	info, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		// no original file
-	} else if err != nil {
-		return err
-	} else {
-		if err := os.Chmod(name, info.Mode()); err != nil {
-			return fmt.Errorf("can't set filemode on tempfile %q: %v", name, err)
-		}
-	}
-	if err := os.Rename(name, filename); err != nil {
-		return fmt.Errorf("cannot replace %q with tempfile %q: %v", filename, name, err)
-	}
-	return nil
 }
 
 func doMapTask(mapf func(string, string) []KeyValue, reply GetTaskResponse) {
@@ -167,20 +122,25 @@ func doMapTask(mapf func(string, string) []KeyValue, reply GetTaskResponse) {
 			defer wg.Done()
 
 			oname := prefix + strconv.Itoa(Y)
-			file, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Fatalf("cannot create %v", oname)
-			}
-			defer file.Close()
+			// file, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			// if err != nil {
+			// 	log.Fatalf("cannot create %v", oname)
+			// }
+			// defer file.Close()
 
 			// write key/value pairs in JSON format to an open file
-			enc := json.NewEncoder(file)
+			// enc := json.NewEncoder(file)
+			// use buffer to realize atomical writing
+			var buf bytes.Buffer
+			enc := json.NewEncoder(&buf)
+
 			for _, kv := range kv_buckets[Y] {
 				err := enc.Encode(&kv)
 				if err != nil {
 					log.Fatalf("cannot encode %v", kv)
 				}
 			}
+			atomicWriteFile(oname, &buf)
 		}(Y)
 	}
 
@@ -200,6 +160,8 @@ func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) 
 		if err != nil {
 			log.Fatalf("cannot open %v", iname)
 		}
+		defer file.Close()
+
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
@@ -210,11 +172,12 @@ func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) 
 		}
 	}
 
-	sort.Sort(ByKey(kva))
+	sort.Sort(ByKey(kva)) // maybe we can use map to avoid Sort
 
 	// write output
 	oname := "mr-out-" + strconv.Itoa(Y)
-	ofile, _ := os.Create(oname)
+	// ofile, _ := os.Create(oname)
+	var buf bytes.Buffer
 
 	i := 0
 	for i < len(kva) {
@@ -228,11 +191,13 @@ func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) 
 		}
 		output := reducef(kva[i].Key, values)
 
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		// fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(&buf, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
 
+	atomicWriteFile(oname, &buf)
 	doReport(reply.Index)
 }
 
@@ -282,4 +247,51 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func atomicWriteFile(filename string, r io.Reader) (err error) {
+	// write to a temp file first, then we'll atomically replace the target file
+	// with the temp file.
+	dir, file := filepath.Split(filename)
+	if dir == "" {
+		dir = "."
+	}
+
+	f, err := ioutil.TempFile(dir, file)
+	if err != nil {
+		return fmt.Errorf("cannot create temp file: %v", err)
+	}
+	defer func() {
+		if err != nil {
+			// Don't leave the temp file lying around on error.
+			_ = os.Remove(f.Name()) // yes, ignore the error, not much we can do about it.
+		}
+	}()
+	// ensure we always close f. Note that this does not conflict with  the
+	// close below, as close is idempotent.
+	defer f.Close()
+	name := f.Name()
+	if _, err := io.Copy(f, r); err != nil {
+		return fmt.Errorf("cannot write data to tempfile %q: %v", name, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("can't close tempfile %q: %v", name, err)
+	}
+
+	// get the file mode from the original file and use that for the replacement
+	// file, too.
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		// no original file
+	} else if err != nil {
+		return err
+	} else {
+		if err := os.Chmod(name, info.Mode()); err != nil {
+			return fmt.Errorf("can't set filemode on tempfile %q: %v", name, err)
+		}
+	}
+	if err := os.Rename(name, filename); err != nil {
+		return fmt.Errorf("cannot replace %q with tempfile %q: %v", filename, name, err)
+	}
+	return nil
 }

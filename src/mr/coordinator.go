@@ -55,11 +55,13 @@ func (c *Coordinator) GetTask(args *GetTaskRequest, reply *GetTaskResponse) erro
 	defer c.mu.Unlock()
 
 	if c.phase == CompletePhase {
+		// log.Println("CompletePhase")
 		reply.JobType = CompleteJob
 		return nil
 	}
 
 	if len(c.remainingTasks) > 0 { // assign a task
+		// log.Println("assign a task")
 		task := c.remainingTasks[0]
 		task.status = Working
 		task.startTime = time.Now()
@@ -76,13 +78,16 @@ func (c *Coordinator) GetTask(args *GetTaskRequest, reply *GetTaskResponse) erro
 		reply.NReduce = c.nReduce
 		reply.NMap = c.nMap
 	} else if len(c.assignedTasks) > 0 { // wait for a task to finish
+		// log.Println("wait for a task to finish")
 		for _, task := range c.assignedTasks {
 			if task.status == Working && time.Since(task.startTime) > MaxTaskRunInterval {
 				switch c.phase {
 				case MapPhase:
+					// log.Println("MapPhase")
 					reply.JobType = MapJob
 					reply.Filename = task.fileName
 				case ReducePhase:
+					// log.Println("ReducePhase")
 					reply.JobType = ReduceJob
 				}
 				reply.Index = task.id
@@ -93,6 +98,7 @@ func (c *Coordinator) GetTask(args *GetTaskRequest, reply *GetTaskResponse) erro
 		}
 		reply.JobType = WaitJob // wait for all map tasks to finish
 	} else { // all tasks finished, schedule the next phase
+		// log.Printf("%v finished, schedule the next phase", c.phase)
 		if c.phase == MapPhase {
 			c.phase = ReducePhase
 			c.Schedule()
@@ -170,8 +176,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 }
 
 func (c *Coordinator) Schedule() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// c.mu.Lock()
+	// defer c.mu.Unlock()
 	switch c.phase {
 	case MapPhase:
 		c.remainingTasks = make([]Task, 0)

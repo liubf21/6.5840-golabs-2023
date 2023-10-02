@@ -62,28 +62,18 @@ RPC 构成: 任务类型 索引(任务编号)
 Map的文件名 Map任务数
 Reduce任务数
 
-strconv.Itoa 整数转换为字符串
+简陋的实现了第一版，测试中除了crash test，别的都过了，但还没实现并行和加锁
 
-用锁来实现并发
+coordinator用计数来检测任务是否完成，虽然简单且高效，但有很多弊端，完全不清楚具体的任务完成和未完成的情况，遇到worker崩溃时无法解决，鲁棒性差，并非好的实现。
 
-没加锁的单线程实现，遇到错误 循环中没有对变量重新初始化，而在通过RPC传递时，有些没用到的变量又没有更改，具体如下
-
-+ Go RPC sends only struct fields whose names start with capital letters. Sub-structures must also have capitalized field names.
-+ When calling the RPC call() function, the reply struct should contain all default values. RPC calls should look like this:
-  reply := SomeType{}
-  call(..., &reply)
-without setting any fields of reply before the call. If you pass reply structures that have non-default fields, the RPC system may silently return incorrect values.
-
-简陋的实现了一版，测试中除了crash test，别的都过了，但还没实现并行和加锁
-
-我的实现中 coordinator 用计数来检测任务是否完成，虽然简单且高效，但有很多弊端，完全不清楚具体的任务完成和未完成的情况，遇到 worker 崩溃时无法解决，鲁棒性差，并非好的实现。
-
-better 实现:
+完善后的实现:
 coordinator用tasks数组来记录任务的完成情况，用锁来保证并发
 worker获取任务并执行，更新任务状态，
 coordinator在worker获取任务时，需对全部任务的状态进行检测来得到待分配的任务(为了避免每次遍历所有任务来获取，维护一个队列？)
+coordinator中其实不需要使用`go func() {...}()`，一次RPC请求返回一个结果即可；而在worker中对多文件操作是可以使用的，需要配合sync.WaitGroup
 
-需要的结构
+
+完整结构
 Coordinator: files, nReduce, nMap, assignedTasks(全部任务应该由Coordinator来管理), remainingTasks, mutex
   两个方法，获取任务(Task->GetTaskResponse)，通知任务完成
 任务状态: 待分配<->已分配->已完成 
@@ -91,17 +81,30 @@ Coordinator: files, nReduce, nMap, assignedTasks(全部任务应该由Coordinato
   阶段: Map, Reduce
   Map阶段中，如果待分配和已分配的任务都为空，则进入Reduce阶段
 
-读写的原子性 先生成一个临时文件再利用系统调用 `OS.Rename` 来完成原子性替换，这样即可保证写文件的原子性。
-处理崩溃
-最长等待10秒 问题，如果待分配任务为空，而已分配任务未做完，有worker请求任务，此时应该等待 
+遇到的错误
+1. 循环中没有对变量重新初始化，而在通过RPC传递时，有些没用到的变量又没有更改，具体如下
 
-离谱，我都不知道 coordinator 中哪里可以加入并行，直接`go func() {...}()`，这样太呆了，而且没有阻塞
++ Go RPC sends only struct fields whose names start with capital letters. Sub-structures must also have capitalized field names.
++ When calling the RPC call() function, the reply struct should contain all default values. RPC calls should look like this:
+  reply := SomeType{}
+  call(..., &reply)
+without setting any fields of reply before the call. If you pass reply structures that have non-default fields, the RPC system may silently return incorrect values.
+
+
+2. 处理崩溃 最长等待10秒 
+如果待分配任务为空，而已分配任务未做完，有worker请求任务，此时应该等待 
+
+3. 用Schedule进行任务的初始化，注意内部不能用锁，因为会在GetTask中调用，内部用锁会导致死锁。
+
+4. 读写的原子性 先生成一个临时文件再利用系统调用 `OS.Rename` 来完成原子性替换，这样即可保证写文件的原子性。
+
+
 
 + The coordinator, as an RPC server, will be concurrent; don't forget to lock shared data.
 + The coordinator can't reliably distinguish between crashed workers, workers that are alive but have stalled for some reason, and workers that are executing but too slowly to be useful. **The best you can do is have the coordinator wait for some amount of time, and then give up and re-issue the task to a different worker.** For this lab, have the coordinator wait for ten seconds; after that the coordinator should assume the worker has died (of course, it might not have).
-+ If you choose to implement Backup Tasks (Section 3.6), note that we test that your code doesn't schedule extraneous tasks when workers execute tasks without crashing. Backup tasks should only be scheduled after some relatively long period of time (e.g., 10s).
++ If you choose to implement **Backup Tasks** (Section 3.6), note that we test that your code doesn't schedule extraneous tasks when workers execute tasks without crashing. Backup tasks should only be scheduled after some relatively long period of time (e.g., 10s).
 + To test crash recovery, you can use the mrapps/crash.go application plugin. It randomly exits in the Map and Reduce functions.
-+ To ensure that nobody observes partially written files in the presence of crashes, the MapReduce paper mentions the trick of using a temporary file and atomically renaming it once it is completely written. You can use ioutil.TempFile to create a temporary file and os.Rename to atomically rename it.
++ To ensure that nobody observes partially written files in the presence of crashes, the MapReduce paper mentions the trick of **using a temporary file and atomically renaming it once it is completely written**. You can use ioutil.TempFile to create a temporary file and os.Rename to atomically rename it.
 
 竞争检测器
 
