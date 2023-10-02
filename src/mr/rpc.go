@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -24,24 +26,31 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
-type Jobtype int
+type JobType uint8
 
 const (
-	MapJob Jobtype = iota
+	MapJob JobType = iota
 	ReduceJob
 	WaitJob
 	CompleteJob
 )
 
-type MyArgs struct {
+type GetTaskRequest struct {
 }
 
-type MyReply struct {
-	JobType  Jobtype
+type GetTaskResponse struct {
+	JobType  JobType
 	Index    int
 	Filename string
-	NReduce  int
-	NMap     int
+	NReduce  int // used by map
+	NMap     int // used by reduce
+}
+
+type ReportRequest struct {
+	Index int
+}
+
+type ReportResponse struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name

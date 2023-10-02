@@ -1,15 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-import "io/ioutil"
-import "encoding/json"
-import "time"
-import "sort"
-import "strconv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -44,100 +46,21 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	for {
 		// ask for a task
-		args := MyArgs{}
-		reply := MyReply{}
-		ok := call("Coordinator.GetTask", &args, &reply)
+		// args := HeartbeatRequest{}
+		// reply := HeartbeatResponse{}
+		// ok := call("Coordinator.GetTask", &args, &reply)
 
-		if !ok {
-			return // maybe the coordinator has exited
-		}
-		// response := doHeartbeat()
-		// log.Printf("Worker: receive coordinator's heartbeat %v \n", reply)
+		// if !ok {
+		// 	return // maybe the coordinator has exited
+		// }
+		reply := doHeartbeat()
+		log.Printf("Worker: receive coordinator's heartbeat %v \n", reply)
 
 		switch reply.JobType {
-		case MapJob:
-			{ // Map
-				file, err := os.Open(reply.Filename)
-				if err != nil {
-					log.Fatalf("cannot open %v", reply.Filename)
-				}
-				content, err := ioutil.ReadAll(file)
-				if err != nil {
-					log.Fatalf("cannot read %v", reply.Filename)
-				}
-				file.Close()
-				kva := mapf(reply.Filename, string(content))
-
-				// divide
-				kv_buckets := make([][]KeyValue, 10)
-				for _, kv := range kva {
-					Y := ihash(kv.Key) % reply.NReduce // buckets
-					kv_buckets[Y] = append(kv_buckets[Y], kv)
-				}
-
-				// write intermediate data to disk
-				X := reply.Index
-				prefix := "mr-" + strconv.Itoa(X) + "-"
-
-				for Y := 0; Y < reply.NReduce; Y++ {
-					oname := prefix + strconv.Itoa(Y)
-
-					file, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if err != nil {
-						log.Fatalf("cannot create %v", oname)
-					}
-					defer file.Close()
-
-					// write key/value pairs in JSON format to an open file
-					enc := json.NewEncoder(file)
-					for _, kv := range kv_buckets[Y] {
-						enc.Encode(&kv)
-					}
-				}
-			}
-		case ReduceJob:
-			{ // Reduce
-				Y := reply.Index // 0-9
-				// log.Printf(":%v\n", Y)
-				kva := []KeyValue{}
-
-				// read all files suffixed with Y
-				for X := 0; X < reply.NMap; X++ {
-					iname := "mr-" + strconv.Itoa(X) + "-" + strconv.Itoa(Y)
-					file, _ := os.Open(iname)
-					dec := json.NewDecoder(file)
-					for {
-						var kv KeyValue
-						if err := dec.Decode(&kv); err != nil {
-							break
-						}
-						kva = append(kva, kv)
-					}
-				}
-
-				sort.Sort(ByKey(kva))
-
-				// write output
-				oname := "mr-out-" + strconv.Itoa(Y)
-				ofile, _ := os.Create(oname)
-
-				i := 0
-				for i < len(kva) {
-					j := i + 1
-					for j < len(kva) && kva[j].Key == kva[i].Key {
-						j++
-					}
-					values := []string{}
-					for k := i; k < j; k++ {
-						values = append(values, kva[k].Value)
-					}
-					output := reducef(kva[i].Key, values)
-
-					fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
-
-					i = j
-				}
-			}
+		case MapJob: // Map
+			doMapTask(mapf, reply)
+		case ReduceJob: // Reduce
+			doReduceTask(reducef, reply)
 		case WaitJob:
 			time.Sleep(1 * time.Second)
 		case CompleteJob:
@@ -146,10 +69,105 @@ func Worker(mapf func(string, string) []KeyValue,
 			panic(fmt.Sprintf("unexpected JobType %v", reply.JobType))
 		}
 
-		ok = call("Coordinator.DoneTask", &reply, &args) // reverse
-		if !ok {
-			return
+		doReport(reply.Index)
+	}
+}
+
+func doHeartbeat() GetTaskResponse {
+	args := GetTaskRequest{}
+	reply := GetTaskResponse{}
+	call("Coordinator.GetTask", &args, &reply)
+
+	return reply
+}
+
+func doReport(i int) {
+	args := ReportRequest{Index: i}
+	reply := ReportResponse{}
+	call("Coordinator.Report", &args, &reply)
+}
+
+func doMapTask(mapf func(string, string) []KeyValue, reply GetTaskResponse) {
+
+	file, err := os.Open(reply.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.Filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.Filename)
+	}
+	file.Close()
+	kva := mapf(reply.Filename, string(content))
+
+	// divide
+	kv_buckets := make([][]KeyValue, 10)
+	for _, kv := range kva {
+		Y := ihash(kv.Key) % reply.NReduce // buckets
+		kv_buckets[Y] = append(kv_buckets[Y], kv)
+	}
+
+	// write intermediate data to disk
+	X := reply.Index
+	prefix := "mr-" + strconv.Itoa(X) + "-"
+
+	for Y := 0; Y < reply.NReduce; Y++ {
+		oname := prefix + strconv.Itoa(Y)
+
+		file, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("cannot create %v", oname)
 		}
+		defer file.Close()
+
+		// write key/value pairs in JSON format to an open file
+		enc := json.NewEncoder(file)
+		for _, kv := range kv_buckets[Y] {
+			enc.Encode(&kv)
+		}
+	}
+}
+
+func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) {
+	Y := reply.Index // 0-9
+	// log.Printf(":%v\n", Y)
+	kva := []KeyValue{}
+
+	// read all files suffixed with Y
+	for X := 0; X < reply.NMap; X++ {
+		iname := "mr-" + strconv.Itoa(X) + "-" + strconv.Itoa(Y)
+		file, _ := os.Open(iname)
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+
+	sort.Sort(ByKey(kva))
+
+	// write output
+	oname := "mr-out-" + strconv.Itoa(Y)
+	ofile, _ := os.Create(oname)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
 	}
 }
 
