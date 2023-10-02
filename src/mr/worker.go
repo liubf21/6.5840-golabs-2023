@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -68,8 +71,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		default:
 			panic(fmt.Sprintf("unexpected JobType %v", reply.JobType))
 		}
-
-		doReport(reply.Index)
 	}
 }
 
@@ -85,6 +86,53 @@ func doReport(i int) {
 	args := ReportRequest{Index: i}
 	reply := ReportResponse{}
 	call("Coordinator.Report", &args, &reply)
+}
+
+func atomicWriteFile(filename string, r io.Reader) (err error) {
+	// write to a temp file first, then we'll atomically replace the target file
+	// with the temp file.
+	dir, file := filepath.Split(filename)
+	if dir == "" {
+		dir = "."
+	}
+
+	f, err := ioutil.TempFile(dir, file)
+	if err != nil {
+		return fmt.Errorf("cannot create temp file: %v", err)
+	}
+	defer func() {
+		if err != nil {
+			// Don't leave the temp file lying around on error.
+			_ = os.Remove(f.Name()) // yes, ignore the error, not much we can do about it.
+		}
+	}()
+	// ensure we always close f. Note that this does not conflict with  the
+	// close below, as close is idempotent.
+	defer f.Close()
+	name := f.Name()
+	if _, err := io.Copy(f, r); err != nil {
+		return fmt.Errorf("cannot write data to tempfile %q: %v", name, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("can't close tempfile %q: %v", name, err)
+	}
+
+	// get the file mode from the original file and use that for the replacement
+	// file, too.
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		// no original file
+	} else if err != nil {
+		return err
+	} else {
+		if err := os.Chmod(name, info.Mode()); err != nil {
+			return fmt.Errorf("can't set filemode on tempfile %q: %v", name, err)
+		}
+	}
+	if err := os.Rename(name, filename); err != nil {
+		return fmt.Errorf("cannot replace %q with tempfile %q: %v", filename, name, err)
+	}
+	return nil
 }
 
 func doMapTask(mapf func(string, string) []KeyValue, reply GetTaskResponse) {
@@ -111,21 +159,33 @@ func doMapTask(mapf func(string, string) []KeyValue, reply GetTaskResponse) {
 	X := reply.Index
 	prefix := "mr-" + strconv.Itoa(X) + "-"
 
+	// use go routine to write to disk
+	var wg sync.WaitGroup
 	for Y := 0; Y < reply.NReduce; Y++ {
-		oname := prefix + strconv.Itoa(Y)
+		wg.Add(1)
+		go func(Y int) {
+			defer wg.Done()
 
-		file, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatalf("cannot create %v", oname)
-		}
-		defer file.Close()
+			oname := prefix + strconv.Itoa(Y)
+			file, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Fatalf("cannot create %v", oname)
+			}
+			defer file.Close()
 
-		// write key/value pairs in JSON format to an open file
-		enc := json.NewEncoder(file)
-		for _, kv := range kv_buckets[Y] {
-			enc.Encode(&kv)
-		}
+			// write key/value pairs in JSON format to an open file
+			enc := json.NewEncoder(file)
+			for _, kv := range kv_buckets[Y] {
+				err := enc.Encode(&kv)
+				if err != nil {
+					log.Fatalf("cannot encode %v", kv)
+				}
+			}
+		}(Y)
 	}
+
+	wg.Wait()
+	doReport(reply.Index)
 }
 
 func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) {
@@ -136,7 +196,10 @@ func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) 
 	// read all files suffixed with Y
 	for X := 0; X < reply.NMap; X++ {
 		iname := "mr-" + strconv.Itoa(X) + "-" + strconv.Itoa(Y)
-		file, _ := os.Open(iname)
+		file, err := os.Open(iname)
+		if err != nil {
+			log.Fatalf("cannot open %v", iname)
+		}
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
@@ -169,6 +232,8 @@ func doReduceTask(reducef func(string, []string) string, reply GetTaskResponse) 
 
 		i = j
 	}
+
+	doReport(reply.Index)
 }
 
 // example function to show how to make an RPC call to the coordinator.
