@@ -321,7 +321,7 @@ func (rf *Raft) ticker() {
 		if _, isLeader := rf.GetState(); isLeader {
 			DPrintf("%v: I am the leader\n", rf.me)
 			// Check if the leader should send out heartbeats.
-			if time.Since(rf.lastTimeHeard) > time.Duration(10*time.Millisecond) {
+			if time.Since(rf.lastTimeHeard) > time.Duration(50*time.Millisecond) {
 				for i := range rf.peers {
 					if i != rf.me {
 						go rf.sendAppendEntries(i,
@@ -394,7 +394,7 @@ func (rf *Raft) ticker() {
 		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 50 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }

@@ -1,5 +1,5 @@
 
-## Lab1
+## Lab1 MapReduce
 
 [Go语言](https://www.youtube.com/watch?v=IdCbMO0Ey9I)
 思路 
@@ -120,5 +120,33 @@ go run mrcoordinator.go pg-*.txt
 go run mrworker.go wc.so
 ```
 
-## Lab2
+## Lab2 Raft
+
+Raft organizes client requests into a sequence, called the log, and ensures that all the replica servers see the same log. Each replica executes client requests in log order, applying them to its local copy of the service's state. Since all the live replicas see the same log contents, they all execute the same requests in the same order, and thus continue to have identical service state. If a server fails but later recovers, Raft takes care of bringing its log up to date. Raft will continue to operate as long as at least a majority of the servers are alive and can talk to each other. If there is no such majority, Raft will make no progress, but will pick up where it left off as soon as a majority can communicate again.
+
+In this lab you'll implement Raft as a Go object type with associated methods, meant to be used as a module in a larger service. A set of Raft instances talk to each other with RPC to maintain replicated logs. Your Raft interface will support an indefinite sequence of numbered commands, also called log entries. The entries are numbered with index numbers. The log entry with a given index will eventually be committed. At that point, your Raft should send the log entry to the larger service for it to execute.
+
+A service calls Make(peers,me,…) to create a Raft peer. The peers argument is an array of network identifiers of the Raft peers (including this one), for use with RPC. The me argument is the index of this peer in the peers array. Start(command) asks Raft to start the processing to append the command to the replicated log. Start() should return immediately, without waiting for the log appends to complete. The service expects your implementation to send an ApplyMsg for each newly committed log entry to the applyCh channel argument to Make().
+
+
+
+A Raft instance has two time-driven activities: the leader must send heart-beats, and others must start an election if too much time has passed since hearing from the leader. It's probably best to drive each of these activities with a dedicated long-running goroutine, rather than combining multiple activities into a single goroutine.
+
+### 2A: leader election 
+
+Implement Raft leader election and heartbeats (AppendEntries RPCs with no log entries). The goal for Part 2A is for a single leader to be elected, for the leader to remain the leader if there are no failures, and for a new leader to take over if the old leader fails or if packets to/from the old leader are lost.
+1. Fill in the RequestVoteArgs and RequestVoteReply structs. Modify Make() to create a background goroutine that will kick off leader election periodically by sending out RequestVote RPCs when it hasn't heard from another peer for a while. This way a peer will learn who is the leader, if there is already a leader, or become the leader itself. Implement the RequestVote() RPC handler so that servers will vote for one another.
+2.  To implement heartbeats, define an AppendEntries RPC struct (though you may not need all the arguments yet), and have the leader send them out periodically. Write anAppendEntries RPC handler method that resets the election timeout so that other servers don't step forward as leaders when one has already been elected.
+
+遇到的问题
+对于一个节点，如何判断是leader，并发送heartbeats
+如何判断一定时间内未收到信息，并发起选举(增加currentTerm) ；收到选举请求时重置timeout时间
+假如timeout在150-300，则heartbeats应该比150小；tester中限制10次heartbeats每秒，timeout应大一些(参数设置不合适会导致测试有概率不通过)
+每个节点每个任期只能投一票，如果是candidate就投给自己，否则投给最先请求的节点；当收到heartbeats，就知道新leader产生
+两种失败原因，会导致新任期的选举
+旧leader意识到新leader产生(在意识到之前已经不起作用了)，收到新的AppendEntries
+
+The management of the election timeout is a common source of headaches. Perhaps the simplest plan is to maintain a variable in the Raft struct containing the last time at which the peer heard from the
+leader, and to have the election timeout goroutine periodically check to see whether the time since then is greater than the timeout period. It's easiest to use time.Sleep() with a small constant argument to
+drive the periodic checks. Don't use time.Ticker and time.Timer; they are tricky to use correctly.
 
