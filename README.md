@@ -141,7 +141,7 @@ Implement Raft leader election and heartbeats (AppendEntries RPCs with no log en
 遇到的问题
 对于一个节点，如何判断是leader，并发送heartbeats
 如何判断一定时间内未收到信息，并发起选举(增加currentTerm) ；收到选举请求时重置timeout时间
-假如timeout在150-300，则heartbeats应该比150小；tester中限制10次heartbeats每秒，timeout应大一些(参数设置不合适会导致测试有概率不通过)
+假如timeout在150-300，则heartbeats应该比150小；tester中限制10次heartbeats每秒，timeout应至少比100大(参数设置不合适会导致测试有概率不通过)
 每个节点每个任期只能投一票，如果是candidate就投给自己，否则投给最先请求的节点；当收到heartbeats，就知道新leader产生
 两种失败原因，会导致新任期的选举
 旧leader意识到新leader产生(在意识到之前已经不起作用了)，收到新的AppendEntries
@@ -151,6 +151,12 @@ Implement Raft leader election and heartbeats (AppendEntries RPCs with no log en
 The management of the election timeout is a common source of headaches. Perhaps the simplest plan is to maintain a variable in the Raft struct containing the last time at which the peer heard from the
 leader, and to have the election timeout goroutine periodically check to see whether the time since then is greater than the timeout period. It's easiest to use time.Sleep() with a small constant argument to
 drive the periodic checks. Don't use time.Ticker and time.Timer; they are tricky to use correctly.
+
+在投票时 currentTerm 需更新
+
+选举和发送心跳时使用 WaitGroup 会由于掉线的节点进行RPC调用时超时导致问题，不应该用
+
+commitIndex 何时更新
 
 ### 2B: log
 Implement the leader and follower code to append new log entries, so that the go test -run 2B tests pass.

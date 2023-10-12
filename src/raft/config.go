@@ -437,7 +437,6 @@ func (cfg *config) checkOneLeader() int {
 			if cfg.connected[i] {
 				if term, leader := cfg.rafts[i].GetState(); leader {
 					leaders[term] = append(leaders[term], i)
-					fmt.Printf("leader %v elected in term %v\n", i, term)
 				}
 			}
 		}

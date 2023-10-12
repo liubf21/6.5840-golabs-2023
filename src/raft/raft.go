@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -79,6 +78,7 @@ type Raft struct {
 	state         State
 	lastTimeHeard time.Time // last time we heard from leader (used to detect leader failure)
 
+	applyMsgCh chan ApplyMsg
 }
 
 type State uint8
@@ -104,7 +104,6 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	// DPrintf("%v->state: %v", rf.me, rf.state)
 	if rf.state == Leaders {
 		isleader = true
 	}
@@ -180,7 +179,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("%v request vote from %v\n", rf.me, args.CandidateId)
+	Debugf(dVote, "%v get requestVote from %v in term %v", rf.me, args.CandidateId, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -193,6 +192,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote
 	if args.Term > reply.Term { // votedFor is null in new term
+		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
 
@@ -200,7 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.state = Followers
-		DPrintf("%v voted for %v\n", rf.me, args.CandidateId)
+		Debugf(dVote, "%v voted for %v in term %v", rf.me, args.CandidateId, args.Term)
 	}
 }
 
@@ -251,36 +251,49 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	Debugf(dClient, "%v try to Append %v in term %v", rf.me, args.Entries, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	rf.state = Followers
 	rf.lastTimeHeard = time.Now()
 	if args.Term < reply.Term { // Reply false if term < currentTerm
 		reply.Success = false
+		Debugf(dClient, "%v AppendEntries fail because args.Term %v < reply.Term %v", rf.me, args.Term, reply.Term)
+		return
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		Debugf(dClient, "%v AppendEntries fail because log not contain entry at PrevLogIndex %v whose term matches PrevLogTerm %v", rf.me, args.PrevLogIndex, args.PrevLogTerm)
+		return
 	}
 
 	// If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it
 	if len(rf.log) > args.PrevLogIndex+1 {
-		rf.log = rf.log[:args.PrevLogIndex]
+		rf.log = rf.log[:args.PrevLogIndex+1]
+		Debugf(dClient, "%v AppendEntries delete log %v", rf.me, rf.log)
 	}
 
 	// Append any new entries not already in the log
-	// fmt.Println(rf.me, "currentTerm", rf.currentTerm)
 	if reply.Success {
-		DPrintf("%v Append %v \n", rf.me, args.Entries)
-		// fmt.Println(rf.me, "currentTerm", rf.currentTerm)
 		rf.currentTerm = args.Term
-		rf.state = Followers
-		rf.log = append(rf.log, args.Entries...)
+		if len(args.Entries) > 0 {
+			Debugf(dClient, "%v Append %v \n", rf.me, args.Entries)
+			for _, e := range args.Entries {
+				rf.log = append(rf.log, e)
+				rf.applyMsgCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      e.Command,
+					CommandIndex: len(rf.log) - 1,
+				}
+			}
+		}
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex =
@@ -323,10 +336,41 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.commitIndex + 1
 
 	if isLeader { // start agreement on the next command to be appended to Raft's log
-		rf.log = append(rf.log, LogEntry{
-			Term:    term,
-			Command: command,
-		})
+		Debugf(dLeader, "starting agreement on command %v", command)
+		appendEntriesArgs := AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: len(rf.log) - 1,
+			PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+			Entries: []LogEntry{
+				{
+					Term:    term,
+					Command: command,
+				},
+			},
+			LeaderCommit: rf.commitIndex,
+		}
+		for i := range rf.peers {
+			if i != rf.me {
+				go func(i int) {
+					reply := AppendEntriesReply{}
+					rf.sendAppendEntries(i,
+						&appendEntriesArgs,
+						&reply,
+					)
+				}(i)
+			}
+		}
+
+		rf.log = append(rf.log,
+			LogEntry{
+				Term:    term,
+				Command: command,
+			},
+		)
+		rf.applyMsgCh <- ApplyMsg{CommandValid: true, Command: command, CommandIndex: index}
+		rf.commitIndex++
+		Debugf(dLeader, "agreement on command %v complete", command)
 	}
 
 	return index, term, isLeader
@@ -357,50 +401,36 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 
-		_, isLeader := rf.GetState()
+		currentTerm, isLeader := rf.GetState()
 
 		if isLeader {
-			DPrintf("%v: I am the leader. %+v \n", rf.me, rf.currentTerm)
 			// Check if the leader should send out heartbeats.
-			if time.Since(rf.lastTimeHeard) > time.Duration(50*time.Millisecond) {
-				for i := range rf.peers {
-					if i != rf.me {
-						// fmt.Println(rf.me, "send heartbeat to", i)
-						go rf.sendAppendEntries(i,
-							&AppendEntriesArgs{
-								Term:         rf.currentTerm,
-								LeaderId:     rf.me,
-								PrevLogIndex: len(rf.log) - 1,
-								PrevLogTerm:  rf.log[len(rf.log)-1].Term,
-								Entries:      []LogEntry{},
-								LeaderCommit: rf.commitIndex,
-							},
-							&AppendEntriesReply{},
-						)
-					}
-				}
+			if time.Since(rf.lastTimeHeard) > time.Duration(100*time.Millisecond) {
+				Debugf(dLeader, "%v: I am the leader in term %v", rf.me, currentTerm)
+				rf.sendHeartBeat()
 			}
 
 			// If the leader has not heard from the followers in a while,
 			// start a new election.?
-		} else if time.Since(rf.lastTimeHeard) > time.Duration(350*time.Millisecond) {
-			DPrintf("%v: Timeout waiting for leader to respond. Starting new election. %+v \n", rf.me, rf.currentTerm)
-			fmt.Printf("%v: election timeout\n", rf.me)
+		} else if time.Since(rf.lastTimeHeard) > time.Duration(500*time.Millisecond) {
 			rf.mu.Lock()
 			rf.currentTerm++
 			rf.state = Candidates
+			rf.votedFor = rf.me
 			rf.mu.Unlock()
+
+			Debugf(dLeader, "%v: started new election in term %v", rf.me, currentTerm+1)
 
 			count := 0
 			countMu := new(sync.Mutex)
-			var wg sync.WaitGroup
+			// var wg sync.WaitGroup
 			for i := range rf.peers {
 				if i != rf.me {
-					wg.Add(1)
+					// wg.Add(1)
 					// Send a request to the next server.
-					// fmt.Println(rf.me, "send request vote to", i)
 					go func(i int) {
-						defer wg.Done()
+						// defer wg.Done()
+						reply := RequestVoteReply{}
 						ok := rf.sendRequestVote(i,
 							&RequestVoteArgs{
 								Term:         rf.currentTerm,
@@ -408,48 +438,33 @@ func (rf *Raft) ticker() {
 								LastLogIndex: len(rf.log) - 1,
 								LastLogTerm:  rf.log[len(rf.log)-1].Term,
 							},
-							&RequestVoteReply{
-								Term:        0,
-								VoteGranted: false,
-							},
-						)
-						if ok {
-							DPrintf("%v: Received request vote response from %v\n", rf.me, i)
+							&reply,
+						) // timeout would be 5s
+						// Debugf(dVote, "%v: sending request vote to %v", rf.me, i)
+						if ok && reply.VoteGranted {
+							Debugf(dVote, "%v: received Vote from %v in term %v", rf.me, i, currentTerm+1)
 							countMu.Lock()
 							count++
 							countMu.Unlock()
-							DPrintf("count: %v\n", count)
+						}
+						if !ok {
+							Debugf(dVote, "%v: failed to connect to %v", rf.me, i)
 						}
 					}(i)
 				}
 			}
-			wg.Wait()
+			// wg.Wait()
+			time.Sleep(time.Duration(100 * time.Millisecond)) // wait 0.1s
 			countMu.Lock()
 			tmpCount := count
 			countMu.Unlock()
-			DPrintf("%v: Received %v votes\n", rf.me, tmpCount)
+			Debugf(dVote, "%v: Received %v votes in term %v\n", rf.me, tmpCount, currentTerm+1)
 			if tmpCount >= len(rf.peers)/2 { // must wait for all goroutines to finish
-				fmt.Printf("%v: become leader\n", rf.me)
+				Debugf(dLeader, "%v: become leader in term %v\n", rf.me, currentTerm+1)
 				rf.mu.Lock()
 				rf.state = Leaders
 				rf.mu.Unlock()
-				for i := range rf.peers {
-					if i != rf.me {
-						// fmt.Println(rf.me, "send heartbeat to", i)
-						go rf.sendAppendEntries(i,
-							&AppendEntriesArgs{
-								Term:         rf.currentTerm,
-								LeaderId:     rf.me,
-								PrevLogIndex: len(rf.log) - 1,
-								PrevLogTerm:  rf.log[len(rf.log)-1].Term,
-								Entries:      []LogEntry{},
-								LeaderCommit: rf.commitIndex,
-							},
-							&AppendEntriesReply{},
-						)
-					}
-				}
-
+				rf.sendHeartBeat()
 			} else {
 				rf.mu.Lock()
 				rf.state = Followers
@@ -495,6 +510,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.state = Followers
 	rf.lastTimeHeard = time.Now()
+	rf.applyMsgCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -503,4 +519,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) sendHeartBeat() {
+	// var wg sync.WaitGroup
+	for i := range rf.peers {
+		if i != rf.me {
+			// Debugf(dLeader, "%v sending heartbeat to %v", rf.me, i)
+			// wg.Add(1)
+			go func(i int) {
+				reply := AppendEntriesReply{}
+				rf.sendAppendEntries(i,
+					&AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: len(rf.log) - 1,
+						PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+						Entries:      []LogEntry{},
+						LeaderCommit: rf.commitIndex,
+					},
+					&reply,
+				)
+				// wg.Done()
+			}(i)
+		}
+	}
+	// wg.Wait()
 }
