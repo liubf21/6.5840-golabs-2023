@@ -146,7 +146,44 @@ Implement Raft leader election and heartbeats (AppendEntries RPCs with no log en
 两种失败原因，会导致新任期的选举
 旧leader意识到新leader产生(在意识到之前已经不起作用了)，收到新的AppendEntries
 
+读取currentTerm时未加锁导致出错；可能没来的及发AppendEntries，以至于currentTerm不一致，选举成功后需要立即发送AppendEntries
+
 The management of the election timeout is a common source of headaches. Perhaps the simplest plan is to maintain a variable in the Raft struct containing the last time at which the peer heard from the
 leader, and to have the election timeout goroutine periodically check to see whether the time since then is greater than the timeout period. It's easiest to use time.Sleep() with a small constant argument to
 drive the periodic checks. Don't use time.Ticker and time.Timer; they are tricky to use correctly.
 
+### 2B: log
+Implement the leader and follower code to append new log entries, so that the go test -run 2B tests pass.
+
+
+
+## Raft Locking Advice
+
+Rule 1: Whenever you have data that more than one goroutine uses, and
+at least one goroutine might modify the data, the goroutines should
+use locks to prevent simultaneous use of the data. The Go race
+detector is pretty good at detecting violations of this rule (though
+it won't help with any of the rules below).
+
+Rule 2: Whenever code makes a sequence of modifications to shared
+data, and other goroutines might malfunction if they looked at the
+data midway through the sequence, you should use a lock around the
+whole sequence.
+
+Rule 3: Whenever code does a sequence of reads of shared data (or
+reads and writes), and would malfunction if another goroutine modified
+the data midway through the sequence, you should use a lock around the
+whole sequence.
+
+Rule 4: It's usually a bad idea to hold a lock while doing anything
+that might wait: reading a Go channel, sending on a channel, waiting
+for a timer, calling time.Sleep(), or sending an RPC (and waiting for the
+reply). One reason is that you probably want other goroutines to make
+progress during the wait. Another reason is deadlock avoidance. Imagine
+two peers sending each other RPCs while holding locks; both RPC
+handlers need the receiving peer's lock; neither RPC handler can ever
+complete because it needs the lock held by the waiting RPC call.
+
+Rule 5: Be careful about assumptions across a drop and re-acquire of a
+lock. One place this can arise is when avoiding waiting with locks
+held. 
