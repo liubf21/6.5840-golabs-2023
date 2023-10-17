@@ -336,32 +336,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.commitIndex + 1
 
 	if isLeader { // start agreement on the next command to be appended to Raft's log
-		Debugf(dLeader, "starting agreement on command %v", command)
-		appendEntriesArgs := AppendEntriesArgs{
-			Term:         term,
-			LeaderId:     rf.me,
-			PrevLogIndex: len(rf.log) - 1,
-			PrevLogTerm:  rf.log[len(rf.log)-1].Term,
-			Entries: []LogEntry{
-				{
-					Term:    term,
-					Command: command,
-				},
-			},
-			LeaderCommit: rf.commitIndex,
-		}
-		for i := range rf.peers {
-			if i != rf.me {
-				go func(i int) {
-					reply := AppendEntriesReply{}
-					rf.sendAppendEntries(i,
-						&appendEntriesArgs,
-						&reply,
-					)
-				}(i)
-			}
-		}
-
+		Debugf(dLeader, "starting agreement on command %v, commitIndex: %v, lastApplied: %v", command, rf.commitIndex, rf.lastApplied)
 		rf.log = append(rf.log,
 			LogEntry{
 				Term:    term,
@@ -369,11 +344,71 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			},
 		)
 		rf.applyMsgCh <- ApplyMsg{CommandValid: true, Command: command, CommandIndex: index}
-		rf.commitIndex++
-		Debugf(dLeader, "agreement on command %v complete", command)
+
 	}
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) waitForAppendEntries() {
+	for rf.killed() == false {
+		currentTerm, isLeader := rf.GetState()
+		if isLeader {
+			appendEntriesArgs := AppendEntriesArgs{
+				Term:         currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.nextIndex[rf.me] - 1,
+				PrevLogTerm:  rf.log[rf.nextIndex[rf.me]-1].Term,
+				LeaderCommit: rf.commitIndex,
+			}
+			for i := range rf.peers {
+				if i != rf.me {
+					if len(rf.log)-1 >= rf.nextIndex[i] { // If last log index ≥ nextIndex for a follower
+						go func(i int) {
+							appendEntriesArgs.Entries = rf.log[rf.nextIndex[i]:]
+							reply := AppendEntriesReply{}
+							rf.sendAppendEntries(i,
+								&appendEntriesArgs,
+								&reply,
+							)
+							if reply.Success {
+								rf.mu.Lock()
+								defer rf.mu.Unlock()
+								rf.nextIndex[i] += len(appendEntriesArgs.Entries)
+								rf.matchIndex[i] = rf.nextIndex[i] - 1
+							} else if reply.Term == currentTerm {
+								rf.mu.Lock()
+								defer rf.mu.Unlock()
+								rf.nextIndex[i]--
+							}
+						}(i)
+					}
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			for {
+				commitCount := 0
+				for i := range rf.peers {
+					if i != rf.me {
+						if rf.matchIndex[i] > rf.commitIndex {
+							commitCount++
+						}
+					}
+				}
+				Debugf(dLeader, "command %v committed for %d peers", rf.log[rf.commitIndex].Command, commitCount)
+				if commitCount >= len(rf.peers)/2 {
+					rf.commitIndex++
+				} else {
+					Debugf(dLeader, "agreement on command %v incomplete", rf.log[rf.commitIndex].Command)
+					break
+				}
+				if rf.commitIndex == len(rf.log)-1 {
+					break
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -407,6 +442,9 @@ func (rf *Raft) ticker() {
 			// Check if the leader should send out heartbeats.
 			if time.Since(rf.lastTimeHeard) > time.Duration(100*time.Millisecond) {
 				Debugf(dLeader, "%v: I am the leader in term %v", rf.me, currentTerm)
+				rf.mu.Lock()
+				rf.lastTimeHeard = time.Now()
+				rf.mu.Unlock()
 				rf.sendHeartBeat()
 			}
 
@@ -415,8 +453,8 @@ func (rf *Raft) ticker() {
 		} else if time.Since(rf.lastTimeHeard) > time.Duration(500*time.Millisecond) {
 			rf.mu.Lock()
 			rf.currentTerm++
-			rf.state = Candidates
 			rf.votedFor = rf.me
+			rf.state = Candidates
 			rf.mu.Unlock()
 
 			Debugf(dLeader, "%v: started new election in term %v", rf.me, currentTerm+1)
@@ -463,6 +501,10 @@ func (rf *Raft) ticker() {
 				Debugf(dLeader, "%v: become leader in term %v\n", rf.me, currentTerm+1)
 				rf.mu.Lock()
 				rf.state = Leaders
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = 0 // initialize commit index
+				}
 				rf.mu.Unlock()
 				rf.sendHeartBeat()
 			} else {
@@ -506,7 +548,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
-	rf.nextIndex[me] = len(rf.log)
 	rf.matchIndex = make([]int, len(peers))
 	rf.state = Followers
 	rf.lastTimeHeard = time.Now()
@@ -517,6 +558,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.waitForAppendEntries()
 
 	return rf
 }
@@ -533,8 +575,8 @@ func (rf *Raft) sendHeartBeat() {
 					&AppendEntriesArgs{
 						Term:         rf.currentTerm,
 						LeaderId:     rf.me,
-						PrevLogIndex: len(rf.log) - 1,
-						PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
 						Entries:      []LogEntry{},
 						LeaderCommit: rf.commitIndex,
 					},

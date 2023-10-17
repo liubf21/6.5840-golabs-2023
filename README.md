@@ -132,6 +132,32 @@ A service calls Make(peers,me,…) to create a Raft peer. The peers argument is 
 
 A Raft instance has two time-driven activities: the leader must send heart-beats, and others must start an election if too much time has passed since hearing from the leader. It's probably best to drive each of these activities with a dedicated long-running goroutine, rather than combining multiple activities into a single goroutine.
 
+All Servers:
+• If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+• If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+Followers (§5.2):
+• Respond to RPCs from candidates and leaders
+• If election timeout elapses without receiving AppendEntries
+RPC from current leader or granting vote to candidate: convert to candidate
+Candidates (§5.2):
+• On conversion to candidate, start election:
+  • Increment currentTerm
+  • Vote for self
+  • Reset election timer
+  • Send RequestVote RPCs to all other servers
+• If votes received from majority of servers: become leader
+• If AppendEntries RPC received from new leader: convert to
+follower
+• If election timeout elapses: start new election
+
+Leaders:
++ Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server; repeat during idle periods to prevent election timeouts (§5.2)
++ If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
++ If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+  + If successful: update nextIndex and matchIndex for follower (§5.3)
+  + If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
++ If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
+
 ### 2A: leader election 
 
 Implement Raft leader election and heartbeats (AppendEntries RPCs with no log entries). The goal for Part 2A is for a single leader to be elected, for the leader to remain the leader if there are no failures, and for a new leader to take over if the old leader fails or if packets to/from the old leader are lost.
